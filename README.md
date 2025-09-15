@@ -19,3 +19,6 @@ You are more than welcome to submit pull requests. This README needs definitely 
 #TODO
 #automatic requesterId retrieval
 #output in CSV
+
+
+This fork has been modified to store the data in UTC.  The offset between local and UTC is based on the local timezone and adjusts for daylight saving time.  
