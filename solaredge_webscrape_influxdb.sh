@@ -43,19 +43,19 @@ declare -A POid=( ["95155874"]="21211C18-3F" ["95155875"]="21211C19-2F" \
 nowtime=$(date "+%y%m%d%H%M%S")
 tmpfolder="/tmp/SEscrape2influx/$nowtime"
 
-function usage {
-    echo "usage: $0 [date]"
-    echo "  date      date to download in format \"YYYY-MM-DD\""
-    echo "  if no date is specified, it will download the 24h data starting yesterday midnight"
-    echo "*************************"
-    echo
-}
+#function usage {
+#    echo "usage: $0 [date]"
+#    echo "  date      date to download in format \"YYYY-MM-DD\""
+#    echo " if no date is specified, it will download the data for today"
+#    echo "*************************"
+#    echo
+#}
 
 if [  $# == 1 ] ; then 
     beginning="$1"
 else
     usage
-    beginning="yesterday 00:00"
+    beginning="today 00:00"
 fi
 
 # Solaredge cookie session is valid for 20 days only. Remove cookie file if older than 15 days
@@ -64,7 +64,7 @@ find $SEcookieFILE -type f -mtime +15 -delete
 # Create cookie file if doesn't already exist
 if [ ! -f "$SEcookieFILE" ]; then
 echo "Getting authorization token"
-cookie=$(curl --silent --location --request POST 'https://monitoring.solaredge.com/solaredge-apigw/api/login' \
+cookie=$(curl --location --request POST 'https://monitoring.solaredge.com/solaredge-apigw/api/login' \
     --header 'Content-Type: application/x-www-form-urlencoded' \
     --data-urlencode "j_username=$SOLAREDGE_USER" \
     --data-urlencode "j_password=$SOLAREDGE_PASS" \
@@ -72,15 +72,38 @@ cookie=$(curl --silent --location --request POST 'https://monitoring.solaredge.c
 fi
 
 startDate=$(($(date -d "$beginning" '+%s')*1000))
-endDate=$(($(date -d "$beginning + 1day" "+%s")*1000))
+endDate=$(($(date -d "$beginning 1day" "+%s")*1000))
 archiveDate=$(date -d "$beginning" "+%y%m%d")
 
-declare -a parameterName=( Current Energy Voltage PowerBox%20Voltage Power )
+# check endDate to deal with the Sunday when time changes
+checkDate=$(($(date -d "$beginning 1day" "+%s")))
+checkDate=$(date -d @"$checkDate")
+if echo "$checkDate" | grep -q 'EDT'; then   # set local daylight saving timezone here
+  offset="14400"
+else
+  offset="18000"
+fi
+
+#declare -a parameterName=( Current Energy Voltage PowerBox%20Voltage Power )
+declare -a parameterName=( Energy Power )
+
 mkdir -p "$tmpfolder"
 mkdir -p "$archive"
 
 for key in "${!POid[@]}"; do
-    for parameter in "${parameterName[@]}"; do
+    for parameter in "${parameterName[@]}"; 
+    do
+      if  [ ${key} == "123456789" -a "$parameter" != "Power" ]   # skip specified keys
+      then
+#       echo "skipping parameter $parameter for key ${key}"
+        continue
+      fi
+      if [ ${key} == "234567890" -a "$parameter" != "Power" ]
+      then
+#        echo "skipping parameter $parameter for key ${key} ]
+         continue
+      fi
+    
     LPfilename="${archiveDate}_solaredge_webscrape.lp"
     JSONfilename="${archiveDate}_solaredge_webscrape.json"
     LPoutput="$tmpfolder/$LPfilename"
@@ -88,19 +111,32 @@ for key in "${!POid[@]}"; do
     PO_id=${POid[${key}]}
     reporterId=${key}
     echo -ne "Downloading $PO_id($parameter) for $(date -d "$beginning"): "
-    response=$(curl -b - --silent --output "$JSONoutput" --write-out '\nHTTP_CODE:%{response_code}\n' -b "$SEcookieFILE" --location --request GET "https://monitoring.solaredge.com/solaredge-web/p/chartData?fieldId=$SOLAREDGE_SITE_ID&startDate=$startDate&endDate=$endDate&reporterId=$reporterId&parameterName=$parameter")
-    echo -ne "$response" | grep HTTP_CODE | tr '\n' '\0'
-    responseParsed=$(jq --raw-output '.dateValuePairs[] | [.value , .date] | join (", ")' < "$JSONoutput")
+    response=$(curl -s -b - --silent --output "$JSONoutput" --write-out '\nHTTP_CODE:%{response_code}\n' -b "$SEcookieFILE" --location --request GET "https://monitoring.solaredge.com/solaredge-web/p/chartData?fieldId=$SOLAREDGE_SITE_ID&startDate=$startDate&endDate=$endDate&reporterId=$reporterId&parameterName=$parameter")
+
+    #   check for error response
+    if [[ $response == *"error"* ]]; then
+        echo -ne "An error occurred at: Downloading $PO_id($parameter) for $(date -d "$beginning"): "
+        echo -ne "$response"
+        exit
+    fi
+    
+#    echo -ne "$response" | grep HTTP_CODE | tr '\n' '\0'
+#    responseParsed=$(jq --raw-output '.dateValuePairs[] | [.value , .date] | join (", ")' < "$JSONoutput")
     if [ -z "$responseParsed" ]; then
+        echo -ne "Downloading $PO_id($parameter) for $(date -d "$beginning"): "
         echo " -> jq skipped (JSON empty)"
     else
-        echo -ne " - jq done"
+#       echo -ne " - jq done"
         while read -r line; do
             value=$(awk '{split($0,a,","); printf "%.3f\n", a[1]; }' <<< "$line")
             epoch=$(awk '{split($0,a,","); print a[2]/1000; }' <<< "$line")
+
+#           SolarEdge reports local time - convert to UTC
+            epoch=$((epoch+offset))
+
             echo "$DBmeasurement,POid=$PO_id $parameter=$value $epoch" >> "$LPoutput"
         done <<< "$responseParsed"
-        echo " - LP parsing done"
+#       echo " - LP parsing done"
     fi
     done
 done
@@ -111,7 +147,7 @@ if [ ! -f "$LPoutput" ]; then
 fi
 
 if [ "$INFLUX" -eq 1 ] ; then
-    echo -ne "*** Posting file to database: $LPoutput ==> "
+#   echo -ne "*** Posting file to database: $LPoutput ==> "
     OK_response=$'HTTP/2 204 \r'
     # OK_response=$'HTTP/1.1 204 No Content\r'
     longresponse=$(curl -s -i -XPOST "$DBhost/write?db=$DBname&u=$DBuser&p=$DBpwd&precision=s" --data-binary @"$LPoutput");
@@ -119,8 +155,8 @@ if [ "$INFLUX" -eq 1 ] ; then
     # echo "$longresponse"
     if [ "${response}" = "${OK_response}" ]; then
         ERROR=0
-        echo "$response"
-        logger -p6 "$0 INFO-SEscrape: Database entry successfull."
+    #   echo "$response"
+        logger -p6 "$0 INFO-SEscrape: Database entry successful."
     else
         ERROR=1
         echo "$response"; echo "$longresponse"
@@ -133,8 +169,8 @@ fi
 
 if [ "$ARCHIVE_ENABLE" -eq 1 ]; then
     if [ "$ERROR" -eq 0 ]; then
-        if zip -j -8 "$archive/${archiveDate}_SEscrape_backup.zip" "$LPoutput"; then rm "$LPoutput"; else ERROR=1; fi
-        if zip -j -8 "$archive/${archiveDate}_SEscrape_backup.zip" "$JSONoutput"; then rm "$JSONoutput"; else ERROR=1; fi
+        if zip -q -j -8 "$archive/${archiveDate}_SEscrape_backup.zip" "$LPoutput"; then rm "$LPoutput"; else ERROR=1; fi
+        if zip -q -j -8 "$archive/${archiveDate}_SEscrape_backup.zip" "$JSONoutput"; then rm "$JSONoutput"; else ERROR=1; fi
     fi
     if [ "$ERROR" -eq 1 ]; then
         echo "*** ERROR. Moving LP and JSON file in archive folder"
@@ -145,3 +181,5 @@ else
     echo "NO ARCHIVE"
 fi
 
+# clean up tmp folder
+rmdir "/tmp/SEscrape2influx/$nowtime"
